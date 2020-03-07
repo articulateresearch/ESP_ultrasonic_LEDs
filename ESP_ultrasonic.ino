@@ -1,7 +1,7 @@
-/* Ultrasonic distance sensor example Simple version
+/* Somnia - a gesture based ultrasonic LED mixer for use with WLED
 
-   Paul Carpenter, PC Services
-   24-Jan-2017
+   Jason Krueger
+   5-March-2019
 
    Uses HC-SR04 four pin ultrasonic sensor to continuously output
    distances found when in range (every second).
@@ -52,11 +52,11 @@ WiFiUDP Udp;
    Should be set in accordance with expected distance for an echo
    Speed of sound is 343 mm/ms or roughly 1/3 meter per millisecond
    Since this is roundtrip your echo is calculated on 2x this distance */
-   /* 51 * 343/2 = 8,746.4 mm = good for 8 and 1/2 ish meters */ 
-#define INTERVAL    51
+/* 51 * 343/2 = 8,746.4 mm = good for 8 and 1/2 ish meters */
+#define INTERVAL    31
 
 /* Timeout (us) for distance sensing rather than 1 second, needs to be less than INTERVAL */
-#define MAX_ECHO    50000
+#define MAX_ECHO    30000
 
 /* Approximate integer scaling factor round trip micro seconds per cm */
 #define SCALE_CM    58
@@ -65,28 +65,51 @@ WiFiUDP Udp;
 #define SCALE_MM    6
 
 /* Maximum Standard Deviation tolerated to determine if distance value is trusted
- *  This will affect how much target jiggling is acceptable to trust a distance measurement
- */
+    This will affect how much target jiggling is acceptable to trust a distance measurement
+*/
 #define DISTANCE_STDEV_MAX   20
 
 /* Maximum stdev (correlating to variance), we will expect
- *  Tuning this higher means a person needs to wiggle their fingers faster
- *  to get the full range of hue.
- *  max in our use case is mapped inverted to low hue/red
- */
+    Tuning this higher means a person needs to wiggle their fingers faster
+    to get the full range of hue.
+    max in our use case is mapped inverted to low hue/red
+*/
 #define DISTANCE_STDEV_HIGH  80
 
 /* Maximum Standard Deviation tolerated to determine if distance value is trusted */
 #define MAX_VELOCITY_THRESHOLD   400
 
 /* Distance (cm) threshold which we trigger effects */
-#define MAX_DISTANCE_THRESHOLD_CM   250
-#define MIN_DISTANCE_THRESHOLD_CM   10
+#define MAX_DISTANCE_THRESHOLD_CM   100
+
+/* max distance in cm we look for gestures */
+#define MAX_EDGE_DISTANCE      100
+/* min distance in cm we look for gestures */
+#define MIN_EDGE_DISTANCE      10
+
+#define MIN_COLOR_DELTA   30
+
+#define DEFAULT_EFFECT 0
+#define DEFAULT_SPEED  127
+
+/* max time between high confidence distance measurements for edges */
+#define MAX_EDGE_TIME_DELTA_MS 300
+/* minimum cm to move in opposite direction before we fix SECOND_EDGE */
+#define MIN_EDGE_DELTA_THRESHOLD_CM 3
+
+#define MAX_GESTURE_DISTANCE_CM 100
+#define MIN_GESTURE_DISTANCE_CM 6
+
+#define MAX_GESTURE_VELOCITY 1000
+#define MIN_GESTURE_VELOCITY 5
 
 #define MAX_HUE              290
 #define MAX_SATURATION       255
 #define MAX_BRIGHTNESS       255
 #define MIN_BRIGHTNESS       50
+
+/* min delta (ms) since last setting secondary colar, rgb2 */
+#define MIN_RGB2_DELTA_MS    1000
 
 /* time values to determine WHEN to do a ping */
 unsigned long next_time, new_time;
@@ -220,18 +243,221 @@ struct WLED_INFO {
 
 WLED_INFO wled_send;
 
-bool setRGB(int red, int green, int blue) {
-  wled_send.red = (byte) red;
-  wled_send.green = (byte) green;
-  wled_send.blue = (byte) blue;
+bool setRGB(struct RGB rgb1, struct RGB rgb2) {
+  wled_send.red = rgb1.red;
+  wled_send.green = rgb1.green;
+  wled_send.blue = rgb1.blue;
+
+  wled_send.red2 = rgb2.red;
+  wled_send.green2 = rgb2.green;
+  wled_send.blue2 = rgb2.blue;
 
   Udp.beginPacket(Wled_IP, WLED_UDP_PORT);
   Udp.write( (uint8_t *) &wled_send, sizeof wled_send);
   return Udp.endPacket();
 }
 
+unsigned long last_distance_microns = 0;
+unsigned long last_millis = 0;
+unsigned long rgb_last_updated = 0;
+
+MedianFilter distances(SAMPLE_SIZE, 0);
+MedianFilter stdevs(SAMPLE_SIZE, DISTANCE_STDEV_MAX);
+
+RGB rgb1 = {0, 0, 0};
+RGB rgb2 = {0, 0, 0};
+
+struct EDGE {
+  int distance_cm;
+  unsigned long time_ms;
+};
+
+struct EDGE edge_initial[3];
+
+struct GESTURE {
+  int index;
+  struct EDGE edge[3];
+};
+
+#define NULL_EDGE     -1
+#define FIRST_EDGE     0
+#define SECOND_EDGE    1
+#define THIRD_EDGE     2
+
+#define MAX_EDGE_INDEX 2
+
+bool validGesture(struct GESTURE gesture) {
+  /* need 3 edges */
+  if (gesture.index == MAX_EDGE_INDEX) {
+    return true;
+  }
+  return false;
+}
+
+void resetGesture (struct GESTURE *gesture) {
+  gesture->index = NULL_EDGE;
+  for (int i = FIRST_EDGE; i <= MAX_EDGE_INDEX; i++)
+  {
+    gesture->edge[i] = (struct EDGE) {
+      0, 0
+    };
+  }
+}
+
+bool addGestureEdge(struct GESTURE *gesture, struct EDGE edge) {
+  Serial.println("addGestureEdge()");
+  bool valid_gesture = false;
+  /* edge detection, find out delta since last edge detection */
+  unsigned long last_edge_time_ms = (gesture->index == NULL_EDGE) ? edge.time_ms : gesture->edge[gesture->index].time_ms;
+  unsigned long edge_delta_ms = edge.time_ms - last_edge_time_ms;
+  last_edge_time_ms = new_time;
+  /* verify time of last edge detection is under a threshold */
+  if (edge_delta_ms <= MAX_EDGE_TIME_DELTA_MS) {
+    /* next edge */
+    Serial.println("edge_delta_ms <= MAX_EDGE_TIME_DELTA_MS");
+    if (edge.distance_cm > MAX_EDGE_DISTANCE) {
+      /* within range, new edge detected */
+      Serial.println("edge.distance_cm > MAX_EDGE_DISTANCE");
+      valid_gesture = validGesture(*gesture);
+      if (valid_gesture) {
+        Serial.println("valid_gesture; return true");
+        return true;
+      }
+      else {
+        /* out of range, reset gesture and return */
+        Serial.println("NOT valid_gesture; reset and return false");
+        resetGesture(gesture);
+        return false;
+      }
+    }
+  }
+  else {
+    /* exceeded MAX_EDGE_TIME_DELTA_MS */
+    Serial.println("NOT edge_delta_ms <= MAX_EDGE_TIME_DELTA_MS");
+    valid_gesture = validGesture(*gesture);
+    if (valid_gesture) {
+      Serial.println("valid_gesture; return true");
+      return true;
+    }
+    else {
+      /* time since last edge detection is exceeded, reset and return */
+      Serial.println("NOT valid_gesture; reset and return false");
+      resetGesture(gesture);
+      return false;
+    }
+  }
+
+  switch (gesture->index) {
+    case NULL_EDGE:
+      /* first edge in gesture, no checks needed */
+      Serial.println("NULL_EDGE; init FIRST_EDGE");
+      if (edge.distance_cm >= MIN_EDGE_DISTANCE) {
+        Serial.println("edge.distance_cm >= MIN_EDGE_DISTANCE");
+        gesture->index = 0;
+        gesture->edge[FIRST_EDGE] = edge;
+        break;
+      }
+      else {
+        Serial.println("NOT edge.distance_cm >= MIN_EDGE_DISTANCE");
+        /* no gesture started, inside MIN_EDGE_DISTANCE, let's reset to DEFAULT_EFFECT */
+        setEffect(DEFAULT_EFFECT, DEFAULT_SPEED);
+      }
+
+    case FIRST_EDGE:
+      Serial.println("FIRST_EDGE");
+      if (edge.distance_cm <= gesture->edge[FIRST_EDGE].distance_cm) {
+        Serial.println("edge.distance_cm <= gesture->edge[FIRST_EDGE].distance_cm; init SECOND_EDGE");
+        /* add if we've moved towards sensor */
+        gesture->index = SECOND_EDGE;
+        gesture->edge[SECOND_EDGE] = edge;
+      }
+      break;
+
+    case SECOND_EDGE: {
+        Serial.println("SECOND_EDGE");
+        int distance_cm = gesture->edge[SECOND_EDGE].distance_cm - gesture->edge[FIRST_EDGE].distance_cm;
+        int delta_cm = edge.distance_cm - gesture->edge[SECOND_EDGE].distance_cm;
+        if (delta_cm <= 0 and distance_cm <= 0) {
+          Serial.println("delta_cm <= 0 and distance_cm <= 0; update SECOND_EDGE");
+          /* we're continuing to move towards sensor, update SECOND_EDGE */
+          gesture->edge[SECOND_EDGE] = edge;
+        }
+        else {
+          Serial.println("NOT delta_cm <= 0 and distance_cm <= 0");
+          if (abs(delta_cm) >= MIN_EDGE_DELTA_THRESHOLD_CM) {
+            Serial.println("abs(delta_cm) >= MIN_EDGE_DELTA_THRESHOLD_CM; init THIRD_EDGE");
+            /* we've turned around finally, create THIRD_EDGE */
+            gesture->index = THIRD_EDGE;
+            gesture->edge[THIRD_EDGE] = edge;
+          }
+        }
+        break;
+      }
+
+    case THIRD_EDGE: {
+        Serial.println("THIRD_EDGE");
+        int distance_cm = gesture->edge[THIRD_EDGE].distance_cm - gesture->edge[SECOND_EDGE].distance_cm;
+        int delta_cm = edge.distance_cm - gesture->edge[THIRD_EDGE].distance_cm;
+        if (delta_cm >= 0 and distance_cm >= 0) {
+          Serial.println("delta_cm >= 0 and distance_cm >= 0; update THIRD_EDGE");
+          /* we're continuing to move away from sensor, update THIRD_EDGE */
+          gesture->edge[THIRD_EDGE] = edge;
+        }
+        else {
+          Serial.println("NOT delta_cm > 0 and distance_cm => 0");
+          if (abs(delta_cm) >= MIN_EDGE_DELTA_THRESHOLD_CM) {
+            /* we've turned around again, call gesture completed */
+            Serial.println("abs(delta_cm) >= MIN_EDGE_DELTA_THRESHOLD_CM; valid_gesture = true");
+            valid_gesture = true;
+          }
+        }
+        break;
+      }
+  }
+
+  Serial.println("return from addGestureEdge()");
+  return valid_gesture;
+}
+
+void setEffect(uint8_t effectIndex, uint8_t effectSpeed) {
+  wled_send.effectCurrent = effectIndex;
+  wled_send.effectSpeed = effectSpeed;
+
+  Udp.beginPacket(Wled_IP, WLED_UDP_PORT);
+  Udp.write( (uint8_t *) &wled_send, sizeof wled_send);
+  Udp.endPacket();
+}
+
+void doTheGesture(struct GESTURE gesture) {
+  Serial.println("doTheGesture()");
+  word effect[3] = {2, 41, 80};
+  /* map distance to effect */
+  int distance_cm = abs(gesture.edge[SECOND_EDGE].distance_cm - gesture.edge[FIRST_EDGE].distance_cm) + abs(gesture.edge[SECOND_EDGE].distance_cm - gesture.edge[THIRD_EDGE].distance_cm);
+  distance_cm = constrain(distance_cm, MIN_GESTURE_DISTANCE_CM, MAX_GESTURE_DISTANCE_CM);
+  // 2 is last index of effect array
+  int effect_index = map(distance_cm, MIN_GESTURE_DISTANCE_CM, MAX_GESTURE_DISTANCE_CM, 0, 2);
+  uint8_t effectIndex = effect[effect_index];
+  unsigned long time_ms = gesture.edge[THIRD_EDGE].time_ms - gesture.edge[FIRST_EDGE].time_ms;
+  // mm / second - so we keep it as an int. 10 x distance_cm = distance_mm. distance_mm / ( time_ms / 1000 ) == 1000 * distance_mm / time_ms
+  int velocity = 10 * 1000 * distance_cm / time_ms;
+  velocity = constrain(velocity, MIN_GESTURE_VELOCITY, MAX_GESTURE_VELOCITY);
+  uint8_t effectSpeed = map(velocity, MIN_GESTURE_VELOCITY, MAX_GESTURE_VELOCITY, 0, 255);
+
+  char buffer[BUFFER_SIZE];
+  sprintf(buffer, "GESTURE UPDATED: distance_cm=%03d velocity=%05d effect_index=%d effectCurrent=%03d effectSpeed=%03d", distance_cm, velocity, effect_index, effectIndex, effectSpeed);
+  Serial.println(buffer);
+
+  setEffect(effectIndex, effectSpeed);
+}
+
+struct GESTURE gesture;
 void setup( )
 {
+  for (int i = FIRST_EDGE; i <= MAX_EDGE_INDEX; i++)
+  {
+    edge_initial[i] = {0, 0};
+  }
+  resetGesture(&gesture);
   wled_send = {     // byte/uint8_t index: name - description
     0,              // 0: purpose - Packet Purpose Byte
     0,              // 1: callMode - do not use notify
@@ -263,13 +489,18 @@ void setup( )
   pinMode( echopin, INPUT );
 
   /* Send signon message */
-  Serial.println( F( "Somnia human light mixer" ) );
+  Serial.println( F( "Somnia human gesture light mixer" ) );
 
   if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
     Serial.println("STA Failed to configure");
   }
 
-  WiFi.begin(ssid, password);
+  if (WiFi.status() != WL_CONNECTED) {
+      WiFi.begin(ssid, password);
+  }
+  else {
+      Serial.println("Already connected?");
+  }
 
   Serial.print("Connecting..");
   while (WiFi.status() != WL_CONNECTED) {
@@ -277,27 +508,6 @@ void setup( )
     Serial.print(".");
   }
 }
-
-unsigned long last_distance_microns = 0;
-int last_millis = 0;
-
-MedianFilter distances(SAMPLE_SIZE, 0);
-MedianFilter stdevs(SAMPLE_SIZE, DISTANCE_STDEV_MAX);
-
-RGB rgb1 = {0, 0, 0};
-RGB rgb2 = {0, 0, 0};
-
-struct EDGE {
-  int distance_cm;
-  unsigned long time_ms;
-};
-
-int last_edge_index = -1; // -1 no edges detected yet
-EDGE edge[3] = {
-  {0, 0},
-  {0, 0},
-  {0, 0}
-};
 
 void loop( )
 {
@@ -321,27 +531,35 @@ void loop( )
     next_time = new_time + INTERVAL;   // save next time to run this part of loop
   }
 
+  if (gesture.index != NULL_EDGE) {
+    if (gesture.index == THIRD_EDGE) {
+      unsigned long time_delta = new_time - gesture.edge[gesture.index].time_ms;
+      if (time_delta > MAX_EDGE_TIME_DELTA_MS) {
+        /* do the gesture */
+        doTheGesture(gesture);
+        resetGesture(&gesture);
+      }
+    }
+  }
+  
   /* Calculate distance only for VALID readings 0 is no echo or timeout */
   if ( distance > 0 ) {
     bool print_summary = true;
     unsigned long distance_microns = 1000 * distance / SCALE_MM;
     int time_delta_ms = new_time - last_millis;
-//    int velocity = last_velocity;
-//    if (time_delta_ms > 0) {
-//      velocity =  abs(last_distance_microns - distance_microns) / time_delta_ms; // mm/ms: any velocity lower than 1mm/ms is not needed
-//    }
     int distance_cm = distance / SCALE_CM;
     int median_distance_cm = distances.in( distance_cm );
     int distance_stdev = distances.getStDev();
     int hue = last_hue;
     int brightness = last_brightness;
     bool HSB_changed = false;
+    bool valid_gesture = false;
 
-    if (distance_stdev < DISTANCE_STDEV_MAX) {
+    if (distance_stdev <= DISTANCE_STDEV_MAX) {
       /* small amount jitter in last few measurements, we can trust the median of the population */
-      if (median_distance_cm < MAX_DISTANCE_THRESHOLD_CM) {
+      if (median_distance_cm <= MAX_DISTANCE_THRESHOLD_CM) {
         /* Median distance under our MAX_DISTANCE_THRESHOLD_CM and has a low stdev.
-            We use distance for brightness and use to estimate velocity
+            We use distance for brightness and then look for a new "edge"
         */
         last_millis = new_time;
         last_distance_microns = distance_microns;
@@ -350,26 +568,22 @@ void loop( )
           HSB_changed = true;
           last_brightness = brightness;
         }
-        median_velocity = velocities.in( velocity );
-        last_velocity = velocity;
-        velocity_stdev = velocities.getStDev();
-        last_velocity_stdev = velocity_stdev;
-        if (velocity_stdev < VELOCITY_STDEV_MAX) {
-          /* we can trust the median velocity measure and we'll constrain extreme outliers, let's use it to change saturation */
-          saturation = map(constrain(median_velocity, 0, MAX_VELOCITY_THRESHOLD), 0, MAX_VELOCITY_THRESHOLD, MAX_SATURATION, 0);
-          if (saturation != last_saturation) {
-            HSB_changed = true;
-            last_saturation = saturation;
-          }
-        }
+
+        EDGE new_edge;
+        new_edge.distance_cm = median_distance_cm;
+        new_edge.time_ms = new_time;
+        valid_gesture = addGestureEdge(&gesture, new_edge);
       }
     }
     else {
       /* large amount jitter in last few measurements */
-      if (median_distance_cm < MAX_DISTANCE_THRESHOLD_CM) {
-        /* some to a lot of jitter, let's use it for changing hue! */
+      if (median_distance_cm < MAX_DISTANCE_THRESHOLD_CM and gesture.index != NULL_EDGE) {
+        /* some to a lot of jitter, let's use it for changing hue!
+            Also make sure we're not in the middle of a gesture
+        */
         int median_stdev = stdevs.in(distance_stdev);
-        hue = map(constrain(median_stdev, DISTANCE_STDEV_MAX, DISTANCE_STDEV_HIGH), DISTANCE_STDEV_MAX, DISTANCE_STDEV_HIGH, MAX_HUE, 0);
+        int max_stdev = stdevs.getMax();
+        hue = map(constrain(max_stdev, DISTANCE_STDEV_MAX, DISTANCE_STDEV_HIGH), DISTANCE_STDEV_MAX, DISTANCE_STDEV_HIGH, MAX_HUE, 0);
         if (hue != last_hue) {
           HSB_changed = true;
           last_hue = hue;
@@ -377,16 +591,39 @@ void loop( )
       }
     }
 
-    getRGB(hue, MAX_SATURATION, brightness, &rgb1);
     if (HSB_changed) {
-      /* update our lights through xSchedule */
-      setRGB(rgb1.red, rgb1.green, rgb1.blue);
+      struct RGB rgb_new;
+      getRGB(hue, MAX_SATURATION, brightness, &rgb_new);
+      int color_delta = abs(rgb_new.red - rgb1.red) + abs(rgb_new.green - rgb1.green) + abs(rgb_new.blue - rgb1.blue);
+      unsigned long rgb_updated_delta = new_time - rgb_last_updated;
+      if (rgb_updated_delta >= MIN_RGB2_DELTA_MS and color_delta >= MIN_COLOR_DELTA) {
+        /* update our primary color through WLED */
+        rgb2 = rgb1;
+        rgb1 = rgb_new;
+        setRGB(rgb1, rgb2);
+        /* secondary color, rgb2, for use in WLED effects */
+        /* min time and min color diff detected */
+        char buffer[BUFFER_SIZE];
+        sprintf(buffer, "RGB1 & RGB2 UPDATED: rgb_updated_delta=%03d color_delta=%d", rgb_updated_delta, color_delta);
+        Serial.println(buffer);
+        rgb_last_updated = new_time;
+      }
+    }
+
+    if (valid_gesture) {
+      /* do the gesture */
+      doTheGesture(gesture);
+      resetGesture(&gesture);
     }
 
     if (print_summary) {
       char buffer[BUFFER_SIZE];
-      sprintf(buffer, "Dist=%03d Med=%03d StDev=%03d Hue=%03d B=%03d Changed=%d R=%03d G=%03d B=%03d TimeDelta=%05d Vel=%09d MedVel=%09d VelStDev=%d",
-              distance_cm, median_distance_cm, distance_stdev, hue, brightness, HSB_changed, rgb1.red, rgb1.green, rgb1.blue, time_delta_ms, velocity, median_velocity, velocity_stdev);
+      sprintf(buffer, "Dist=%03d Med=%03d StDev=%03d Hue=%03d B=%03d Changed=%d [R=%03d G=%03d B=%03d] [R2=%03d G2=%03d B2=%03d] TimeDelta=%08d G={%d, [{%03d, %05d},{%03d, %05d},{%03d, %05d}]}",
+              distance_cm, median_distance_cm, distance_stdev, hue, brightness, HSB_changed, rgb1.red, rgb1.green, rgb1.blue, rgb2.red, rgb2.green, rgb2.blue, time_delta_ms,
+              gesture.index,
+              gesture.edge[FIRST_EDGE].distance_cm, gesture.edge[FIRST_EDGE].time_ms,
+              gesture.edge[SECOND_EDGE].distance_cm, gesture.edge[SECOND_EDGE].time_ms,
+              gesture.edge[THIRD_EDGE].distance_cm, gesture.edge[THIRD_EDGE].time_ms);
       Serial.println(buffer);
     }
   }
